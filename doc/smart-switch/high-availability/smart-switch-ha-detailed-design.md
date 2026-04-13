@@ -7,6 +7,8 @@
 | 0.3 | 03/28/2024 | Riff Jiang | Updated telemetry. |
 | 0.4 | 05/06/2024 | Riff Jiang | Added drop counters for pipeline monitoring. |
 | 0.5 | 06/03/2024 | Riff Jiang | Added DASH BFD probe state update workflow and DB schema. |
+| 0.6 | 03/23/2025 | Riff Jiang | Split DPU table into DPU and REMOTE_DPU. Add FEATURE table. |
+| 0.7 | 12/31/2025 | Vivek Reddy Karri | Added flow dump and timeout field to Bulk sync |
 
 1. [1. High level data flow](#1-high-level-data-flow)
    1. [1.1. Upstream config programming path](#11-upstream-config-programming-path)
@@ -22,6 +24,7 @@
          3. [2.1.2.3. ENI placement table (scope = `eni` only)](#2123-eni-placement-table-scope--eni-only)
       3. [2.1.3. DPU\_APPL\_DB (per-DPU)](#213-dpu_appl_db-per-dpu)
          1. [2.1.3.1. DASH object tables](#2131-dash-object-tables)
+      4. [2.1.4. FEATURE](#214-feature)
    2. [2.2. External facing state tables](#22-external-facing-state-tables)
       1. [2.2.1. STATE\_DB (per-NPU)](#221-state_db-per-npu)
          1. [2.2.1.1. HA scope state](#2211-ha-scope-state)
@@ -35,6 +38,7 @@
          1. [2.3.1.1. HA set configurations](#2311-ha-set-configurations)
          2. [2.3.1.2. HA scope configurations](#2312-ha-scope-configurations)
          3. [2.3.1.3. Flow sync sessions](#2313-flow-sync-sessions)
+         4. [2.3.1.4. Flow dump filter](#2314-flow-dump-filter)
       2. [2.3.2. APPL\_DB (per-NPU)](#232-appl_db-per-npu)
          1. [2.3.2.1. DASH\_ENI\_FORWARD\_TABLE](#2321-dash_eni_forward_table)
       3. [2.3.3. CHASSIS\_STATE\_DB (per-NPU)](#233-chassis_state_db-per-npu)
@@ -58,6 +62,12 @@
       1. [3.4.1. Data plane channel probing (Per-HA Set)](#341-data-plane-channel-probing-per-ha-set)
       2. [3.4.2. Inline flow sync (Per-ENI)](#342-inline-flow-sync-per-eni)
       3. [3.4.3. Bulk sync related counters (Per-HA Set)](#343-bulk-sync-related-counters-per-ha-set)
+   5. [3.5. Flow dump for debugging](#35-flow-dump-for-debugging)
+      1. [3.5.1. Flow dump workflow](#351-flow-dump-workflow)
+      2. [3.5.2. File management](#352-file-management)
+      3. [3.5.3. JSON format specification](#353-json-format-specification)
+      4. [3.5.4. Scale considerations](#354-scale-considerations)
+      5. [3.5.5. CLI (sonic-dpu-flow-dump)](#355-cli-sonic-dpu-flow-dump)
 4. [4. SAI APIs](#4-sai-apis)
 5. [5. CLI commands](#5-cli-commands)
 
@@ -93,6 +103,7 @@ flowchart LR
       subgraph CONFIG DB
          subgraph All NPUs
             NPU_DPU[DPU]
+            NPU_REMOTE_DPU[REMOTE_DPU]
             NPU_VDPU[VDPU]
             NPU_DASH_HA_GLOBAL_CONFIG[DASH_HA_GLOBAL_CONFIG]
          end
@@ -161,9 +172,10 @@ flowchart LR
    NPU_SWSS --> NPU_SYNCD
 
    %% NPU tables --> hamgrd:
-   NPU_DPU --> |SubscribeStateTable| NPU_HAMGRD
-   NPU_VDPU --> |SubscribeStateTable| NPU_HAMGRD
    NPU_DASH_HA_GLOBAL_CONFIG --> |SubscribeStateTable| NPU_HAMGRD
+   NPU_DPU --> |SubscribeStateTable| NPU_HAMGRD
+   NPU_REMOTE_DPU --> |SubscribeStateTable| NPU_HAMGRD
+   NPU_VDPU --> |SubscribeStateTable| NPU_HAMGRD
    NPU_DASH_HA_SET_CONFIG --> |zmq| NPU_HAMGRD
    NPU_DASH_ENI_PLACEMENT --> |zmq| NPU_HAMGRD
    NPU_DASH_HA_SCOPE_CONFIG --> |zmq| NPU_HAMGRD
@@ -309,23 +321,36 @@ The following tables will be programmed either by SDN controller or by the netwo
 * These tables are imported from the SmartSwitch HLD to make the doc more convenient for reading, and we should always use that doc as the source of truth.
 * These tables should be prepopulated before any HA configuration tables below are programmed.
 
-| Table | Key | Field | Description |
-| --- | --- | --- | --- |
-| DPU | | | Physical DPU configuration. |
-| | \<DPU_ID\> | | Physical DPU ID |
-| | | type | Type of DPU. It can be "local", "cluster" or "external". |
-| | | state | Admin state of the DPU device. |
-| | | slot_id | Slot ID of the DPU. |
-| | | pa_ipv4 | IPv4 address. |
-| | | pa_ipv6 | IPv6 address. |
-| | | npu_ipv4 | IPv4 address of its owning NPU loopback. |
-| | | npu_ipv6 | IPv6 address of its owning NPU loopback. |
-| | | probe_ip | Custom probe point if we prefer to use a different one from the DPU IP address. |
-| VDPU | | | Virtual DPU configuration. |
-| | \<VDPU_ID\> | | Virtual DPU ID |
-| | | profile | The profile of the vDPU. |
-| | | tier | The tier of the vDPU. |
-| | | main_dpu_ids | The IDs of the main physical DPU. |
+| Table | Key | Field | Description | Example |
+| --- | --- | --- | --- | --- |
+| DPU | | | Physical DPU information. | |
+| | \<DPU_NAME\> | | Physical DPU Name. | dpu1 |
+| | | state | Admin state of the DPU device. Can be "up", "down" | up |
+| | | local_port | Port of the DPU. | 8080 |
+| | | vip_ipv4 | IPv4 virtual IP address of the DPU. | 50.0.1.1 |
+| | | vip_ipv6 | IPv6 virtual IP address of the DPU. | abcd::1 |
+| | | pa_ipv4 | IPv4 address. | 10.0.1.1 |
+| | | pa_ipv6 | IPv6 address. | aaaa:bbbb:1:1 |
+| | | midplane_ipv4 | Midplane IPv4 address. | 169.254.0.1 |
+| | | dpu_id | Id of the DPU. Integer starting from 0. | 0 |
+| | | vdpu_id | Id of the vDPU. | vdpu1 |
+| | | gnmi_port | TCP listening port for gNMI service on DPU. | 50051 |
+| | | orchagent_zmq_port | TCP listening port for ZMQ service on DPU orchagent. | 5555 |
+| | | swbus_port | TCP listening port of swbus. | 23606 |
+| REMOTE_DPU | | | Remote DPU information. | |
+| | \<DPU_NAME\> | | Physical DPU Name. | remote_dpu1 |
+| | | type | Type of remote DPU. Currently only "cluster" is supported. | cluster |
+| | | pa_ipv4 | IPv4 address. | 10.0.1.2 |
+| | | pa_ipv6 | IPv6 address. | aaaa:bbbb::1:2 |
+| | | npu_ipv4 | IPv4 address of its owning NPU loopback. | 10.0.0.1 |
+| | | npu_ipv6 | IPv6 address of its owning NPU loopback. | aaaa:bbbb::1 |
+| | | dpu_id | Id of the DPU. Integer starting from 0. | 0 |
+| | | swbus_port | TCP listening port of swbus. | 23606 |
+| VDPU | | | Virtual DPU configuration. | |
+| | \<VDPU_ID\> | | Virtual DPU ID | vdpu1 |
+| | | profile | The profile of the vDPU. Currently, only "default" is supported. | default |
+| | | tier | The tier of the vDPU. Currently, only "default" is supported. | default |
+| | | main_dpu_ids | The IDs of the main physical DPU. | dpu1 |
 
 ##### 2.1.1.2. HA global configurations
 
@@ -359,12 +384,11 @@ The following tables will be programmed either by SDN controller or by the netwo
 | | | version | Config version. |
 | | | vip_v4 | IPv4 Data path VIP. |
 | | | vip_v6 | IPv6 Data path VIP. |
-| | | owner | Owner/Driver of HA state machine. It can be `dpu`, `switch`. |
-| | | scope | HA scope. It can be `dpu`, `eni`. |
 | | | vdpu_ids | The ID of the vDPUs. |
-| | | pinned_vdpu_bfd_probe_states | Pinned probe states of vDPUs, connected by ",". Each state can be "" (none), `up` or `down`. |
+| | | scope | HA scope. It can be `dpu`, `eni`. |
+| | | pinned_vdpu_bfd_probe_states | Pinned probe states of vDPUs, connected by ",". Each state can be `none`, `up` or `down`. |
 | | | preferred_vdpu_id | When preferred vDPU ID is set, the traffic will be forwarded to this vDPU when both BFD probes are up. |
-| | | preferred_standalone_vdpu_index | (scope = `eni` only)<br><br>Preferred vDPU index to be standalone when entering into standalone setup. |
+| | | preferred_standalone_vdpu_index | (owner = `switch` only)<br><br>Preferred vDPU index to be standalone when entering into standalone setup. |
 
 ##### 2.1.2.2. HA scope configurations
 
@@ -377,8 +401,10 @@ The following tables will be programmed either by SDN controller or by the netwo
 | | \<VDPU_ID\> | | VDPU ID. |
 | | \<HA_SCOPE_ID\> | | HA scope ID. It can be the HA set id (scope = `dpu`) or ENI id (scope = `eni`) |
 | | | version | Config version. |
+| | | owner | Owner/Driver of HA state machine. It can be `dpu`, `switch`. |
 | | | disabled | If true, disable this vDPU. It can only be `false` or `true`. |
-| | | desired_ha_state | The desired state for this vDPU. It can only be "" (none), `dead`, `active` or `standalone`. |
+| | | ha_set_id | The HA set ID that this ha scope belongs to. |
+| | | desired_ha_state | The desired state for this vDPU. It can only be `none`, `dead`, `active` or `standalone`. |
 | | | approved_pending_operation_ids | Approved pending HA operation id list, connected by "," |
 
 ##### 2.1.2.3. ENI placement table (scope = `eni` only)
@@ -395,7 +421,7 @@ The following tables will be programmed either by SDN controller or by the netwo
 | | | version | Config version. |
 | | | eni_mac | ENI mac address. Used to create the NPU side ACL rules to match the incoming packets and forward to the right DPUs. |
 | | | ha_set_id | The HA set ID that this ENI is allocated to. |
-| | | pinned_next_hop_index | The index of the pinned next hop DPU for this ENI traffic forwarding rule. "" = Not set. |
+| | | pinned_next_hop_index | The index of the pinned next hop DPU for this ENI traffic forwarding rule, or `none` for not set. |
 
 #### 2.1.3. DPU_APPL_DB (per-DPU)
 
@@ -410,6 +436,15 @@ The following tables will be programmed either by SDN controller or by the netwo
 | | | admin_state | Admin state of each DASH ENI. To support control from HA, `STATE_HA_ENABLED` is added. |
 | | | ha_scope_id | HA scope id. It can be the HA set id (scope = `dpu`) or ENI id (scope = `eni`) |
 | | | ... | see [SONiC-DASH HLD](https://github.com/sonic-net/SONiC/blob/master/doc/dash/dash-sonic-hld.md) for more details. |
+
+#### 2.1.4. FEATURE
+
+| Table | Key | Field | Description |
+| --- | --- | --- | --- |
+| FEATURE | | | Feature configuration. |
+| | dash_ha | | dash_ha feature. |
+| | | state | Admin state of dash_ha feature. It can be `enabled` or `disabled`. |
+| | | has_per_dpu_scope | Should always be `true` for dash_ha feature. |
 
 ### 2.2. External facing state tables
 
@@ -475,14 +510,14 @@ To show the current state of HA, the states will be aggregated by `hamgrd` and s
 | --- | --- | --- | --- |
 | | | pending_operation_ids | GUIDs of pending operation IDs, connected by "," |
 | | | pending_operation_types | Type of pending operations, e.g. "switchover", "activate_role", "flow_reconcile", "brainsplit_recover". Connected by "," |
-| | | pending_operation_list_last_updated_time | Last updated time of the pending operation list. |
+| | | pending_operation_list_last_updated_time_in_ms | Last updated time of the pending operation list. |
 | | | switchover_id | Switchover ID (GUID). |
-| | | switchover_state | Switchover state. It can be "pendingapproval", "approved", "inprogress", "completed", "failed" |
+| | | switchover_state | Switchover state. It can be "pending_approval", "approved", "in_progress", "completed", "failed" |
 | | | switchover_start_time_in_ms | The time when operation is created. |
 | | | switchover_end_time_in_ms | The time when operation is ended. |
 | | | switchover_approved_time_in_ms | The time when operation is approved. |
 | | | flow_sync_session_id | Flow sync session ID. |
-| | | flow_sync_session_state | Flow sync session state. It can be  "inprogress", "completed", "failed" |
+| | | flow_sync_session_state | Flow sync session state. It can be  "in_progress", "completed", "failed" |
 | | | flow_sync_session_start_time_in_ms | Flow sync start time in milliseconds. |
 | | | flow_sync_session_target_server | The IP endpoint of the server that flow records are sent to. |
 
@@ -501,7 +536,7 @@ When a HA set configuration on NPU side contains a local DPU, `hamgrd` will crea
 | | | version | Config version. |
 | | | vip_v4 | IPv4 Data path VIP. |
 | | | vip_v6 | IPv6 Data path VIP. |
-| | | owner | Owner of HA state machine. It can be `controller`, `switch`. |
+| | | owner | Owner of HA state machine. It can be `dpu`, `switch`. |
 | | | scope | Scope of HA set. It can be `dpu`, `eni`. |
 | | | local_npu_ip | The IP address of local NPU. It can be IPv4 or IPv6. Used for setting up the BFD session. |
 | | | local_ip | The IP address of local DPU. It can be IPv4 or IPv6. |
@@ -529,11 +564,30 @@ When a HA set configuration on NPU side contains a local DPU, `hamgrd` will crea
 
 | Table | Key | Field | Description |
 | --- | --- | --- | --- |
-| DASH_FLOW_SYNC_SESSION_TABLE | | |  |
-| | \<SESSION_ID\> | | Flow sync session id. |
-| | | ha_set_id | HA set id. |
-| | | target_server_ip | The IP of the server that used to receive flow records. |
-| | | target_server_port | The port of the server that used to receive flow records. |
+| DASH_FLOW_SYNC_SESSION_TABLE | | | Flow sync session table supporting both bulk sync and flow dump sessions. |
+| | \<SESSION_ID\> | | Session ID. |
+| | | type | Session type: "bulk_sync" or "flow_dump". |
+| | | ha_set_id | HA set id (required for bulk_sync type). |
+| | | target_server_ip | The IP of the server that used to receive flow records (required for bulk_sync type). |
+| | | target_server_port | The port of the server that used to receive flow records (required for bulk_sync type). |
+| | | timeout | Timeout to mark the status as failed if the finished notification is not received (default is 120 secs for bulk_sync, 300 secs for flow_dump). |
+| | | flow_state | Boolean: "True/true" or "False/false" (for flow_dump type). If flow state is false, only values under sai_flow_entry_t are present. |
+| | | filter_1 | Reference to filter name in DASH_FLOW_DUMP_FILTER_TABLE (for flow_dump type, optional). |
+| | | filter_2 | Reference to filter name in DASH_FLOW_DUMP_FILTER_TABLE (for flow_dump type, optional). |
+| | | filter_3 | Reference to filter name in DASH_FLOW_DUMP_FILTER_TABLE (for flow_dump type, optional). |
+| | | filter_4 | Reference to filter name in DASH_FLOW_DUMP_FILTER_TABLE (for flow_dump type, optional). |
+| | | filter_5 | Reference to filter name in DASH_FLOW_DUMP_FILTER_TABLE (for flow_dump type, optional). |
+| | | max_flows | Maximum flows to dump (for flow_dump type, default: 1000). |
+
+##### 2.3.1.4. Flow dump filter
+
+| Table | Key | Field | Description |
+| --- | --- | --- | --- |
+| DASH_FLOW_DUMP_FILTER_TABLE | | | Flow dump filter for selecting flows to dump. |
+| | \<FILTER_NAME\> | | Filter name. |
+| | | key | Filter key: eni_addr, ip_protocol, src_ip_addr, dst_ip_addr, src_l4_port, dst_l4_port, or key_version. |
+| | | op | Filter operation: equal_to, greater_than, greater_than_or_equal_to, less_than, or less_than_or_equal_to. |
+| | | value | Value to compare against. Type can be INT, IP, or MAC depending on key |
 
 #### 2.3.2. APPL_DB (per-NPU)
 
@@ -542,12 +596,12 @@ When a HA set configuration on NPU side contains a local DPU, `hamgrd` will crea
 | Table | Key | Field | Description | Value Format |
 | --- | --- | --- | --- | --- |
 | DASH_ENI_FORWARD_TABLE | | | | |
-| | \<VNET_NAME\> | | VNET name. Used to correlate the VNET table to find VNET info, such as advertised VIP. | {{vnet_name}} |
-| | \<ENI_ID\> | | ENI ID. Same as the MAC address of the ENI. | {{eni_id}} |
-| | | vdpu_ids | The list vDPU IDs hosting this ENI. | {{vdpu_id1},{vdpu_id2},...} |
-| | | primary_vdpu | The primary vDPU id. | {{dpu_id}} |
-| | | outbound_vni | (Optional) Outbound VNI used by this ENI, if different from the one in VNET. Each ENI can have its own VNI, such ExpressRoute Gateway Bypass case. | {{vni}} |
-| | | outbound_eni_mac_lookup | (Optional) Specify which MAC address to use to lookup the ENI for the outbound traffic. | "" (default), "dst", "src" |
+| | \<VNET_NAME\> | | VNET name. Used to correlate the VNET table to find VNET info, such as advertised VIP. | /{/{vnet_name/}/} |
+| | \<ENI_ID\> | | ENI ID. Same as the MAC address of the ENI. | /{/{eni_id/}/} |
+| | | vdpu_ids | The list vDPU IDs hosting this ENI. | /{/{vdpu_id1/},/{vdpu_id2/},.../} |
+| | | primary_vdpu | The primary vDPU id. | /{/{dpu_id/}/} |
+| | | outbound_vni | (Optional) Outbound VNI used by this ENI, if different from the one in VNET. Each ENI can have its own VNI, such ExpressRoute Gateway Bypass case. | /{/{vni/}/} |
+| | | outbound_eni_mac_lookup | (Optional) Specify which MAC address to use to lookup the ENI for the outbound traffic. | "none", "dst", "src" |
 
 #### 2.3.3. CHASSIS_STATE_DB (per-NPU)
 
@@ -588,8 +642,10 @@ DPU state table stores the health states of each DPU. These data are collected b
 | DASH_HA_SCOPE_STATE | | | State of each HA scope. |
 | | \<HA_SCOPE_ID\> | | HA scope ID. It can be the HA set ID or ENI ID, depending on the which HA mode is used. |
 | | | last_updated_time | The last update time of this state in milliseconds. |
-| | | ha_role | The current HA role confirmed by ASIC. Please refer to the HA states defined in HA HLD. |
+| | | ha_role | The current HA role confirmed by ASIC. Please refer to the HA roles defined in HA HLD. |
 | | | ha_role_start_time | The time when HA role is moved into current one in milliseconds. |
+| | | ha_state | Please refer to the HA states defined in HA HLD. |
+| | | ha_state_start_time | The time when HA state is moved into current one in milliseconds. |
 | | | ha_term | The current term confirmed by ASIC. |
 | | | activate_role_pending | DPU is pending on role activation. |
 | | | flow_reconcile_pending | Flow reconcile is requested and pending approval. |
@@ -599,11 +655,13 @@ DPU state table stores the health states of each DPU. These data are collected b
 
 | Table | Key | Field | Description |
 | --- | --- | --- | --- |
-| DASH_FLOW_SYNC_SESSION_STATE | | |  |
-| | \<SESSION_ID\> | | Flow sync session id. |
-| | | state | Flow sync session state. It can be "created", "inprogress", "completed", "failed". |
-| | | creation_time_in_ms | Flow sync session creation time in milliseconds. |
-| | | last_state_start_time_in_ms | Flow sync session last state start time in milliseconds. |
+| DASH_FLOW_SYNC_SESSION_STATE | | | Flow sync session state table supporting both bulk sync and flow dump sessions. |
+| | \<SESSION_ID\> | | Session ID (same as config table key). |
+| | | type | Session type: "bulk_sync" or "flow_dump". |
+| | | state | Session state. It can be "created", "in_progress", "completed", "failed". |
+| | | creation_time_in_ms | Session creation time in milliseconds. |
+| | | last_state_start_time_in_ms | Session last state start time in milliseconds. |
+| | | output_file | Path to output file: `/var/dump/flows/flow_dump_<oid>.jsonl.gz` (for flow_dump type, present when state is "completed"). |
 
 ##### 2.3.4.4. DASH BFD probe state
 
@@ -767,6 +825,235 @@ Besides the channel status, we should also have the following counters for the b
 | SAI_HA_SET_STAT_BULK_SYNC_MESSAGE_SEND_FAILED | Number of messages we failed to sent for bulk sync via data channel. |
 | SAI_HA_SET_STAT_BULK_SYNC_FLOW_RECEIVED | Number of flows received from bulk sync message. A single bulk sync message can contain many flow records. |
 | SAI_HA_SET_STAT_BULK_SYNC_FLOW_SENT | Number of flows sent via bulk sync message. A single bulk sync message can contain many flow records. |
+
+### 3.5. Flow dump for debugging
+
+Flow dump is a debugging/testing feature that exports all active flows from SDK to userspace.  This is a highly resource-intensive operation. 
+
+Traditional pattern would be to relay the flow data from syncd to orchagent. This would atleast 2 serialize and 2 deserialize operations as of today. To optimize this, we directly write from syncd process to a file directly.
+
+#### 3.5.1. Flow dump workflow
+
+**Flow Diagram:**
+
+```
+┌──────┐      ┌─────────────┐      ┌──────────────┐      ┌──────────────┐       ┌────────┐      ┌─────┐
+│ User │      │ GNMI Server │      │ DPU Orchagent│      │ DPU_STATE_DB │       │ Syncd  │      │ SDK │
+│      │      │  (via ZMQ)  │      │              │      │              │       │        │      │     │
+└───┬──┘      └──────┬──────┘      └──────┬───────┘      └──────┬───────┘       └───┬────┘      └──┬──┘
+    │                │                    │                     │                   │              │
+    │ 1. Create      │                    │                     │                   │              │
+    │   Filter(s)    │                    │                     │                   │              │
+    │───────────────>│                    │                     │                   │              │
+    │                │                    │                     │                   │              │
+    │ 2. Create      │                    │                     │                   │              │
+    │   Session      │                    │                     │                   │              │
+    │   (type=       │                    │                     │                   │              │
+    │   flow_dump,   │                    │                     │                   │              │
+    │   filter refs) │                    │                     │                   │              │
+    │───────────────>│                    │                     │                   │              │
+    │                │  3. Push config    │                     │                   │              │
+    │                │───────────────────>│                     │                   │              │
+    │                │                    │                     │                   │              │
+    │                │                    │ 4. Create SAI       │                   │              │
+    │                │                    │    Filter & Session │                   │              │
+    │                │                    │────────────────────────────────────────>│              │
+    │                │                    │                     │                   │  SAI API     │
+    │                │                    │                     │                   │─────────────>│
+    │                │                    │                     │                   │              │
+    │                │                    │ 5. Write OID & STATE│                   │              │
+    │                │                    │  type="flow_dump"   │                   │              │
+    │                │                    │  status="in_progress"│                   │              │
+    │                │                    │────────────────────>│                   │              │
+    │                │                    │                     │                   │              │
+    │                │                    │                     │                   │ 6. Stream    │
+    │                │                    │                     │                   │    flows     │
+    │                │                    │                     │                   │<─────────────│
+    │                │                    │                     │                   │ (callback)   │
+    │                │                    │                     │                   │              │
+    │                │                    │                     │                   │ 7. Write     │
+    │                │                    │                     │                   │    JSON      │
+    │                │                    │                     │                   │─────┐        │
+    │                │                    │                     │                   │     │to file │
+    │                │                    │                     │                   │<────┘        │
+    │                │                    │                     │                   │/var/dump/    │
+    │                │                    │                     │                   │flows/        │
+    │                │                    │                     │                   │flow_dump_    │
+    │                │                    │                     │                   │<oid>.jsonl.gz│
+    │                │                    │                     │                   │              │
+    │                │                    │                     │                   │ 8. FINISHED  │
+    │                │                    │                     │                   │     event    │
+    │                │                    │                     │                   │<─────────────│
+    │                │                    │                     │                   │              │
+    │                │                    │ 9. Notify           │                   │              │
+    │                │                    │    completion       │                   │              │
+    │                │                    │<────────────────────────────────────────│              │
+    │                │                    │                     │                   │              │
+    │                │                    │ 10. Write STATE     │                   │              │
+    │                │                    │  type="flow_dump"   │                   │              │
+    │                │                    │  output_file=       │                   │              │
+    │                │                    │  /var/dump/flows/   │                   │              │
+    │                │                    │  flow_dump_<oid>    │                   │              │
+    │                │                    │  .jsonl.gz          │                   │              │
+    │                │                    │  status="completed" │                   │              │
+    │                │                    │────────────────────>│                   │              │
+    │                │                    │                     │                   │              │
+    │                │                    │ 11. Delete Session  │                   │              │
+    │                │                    │────────────────────────────────────────>│              │
+    │                │                    │                     │                   │  SAI API     │
+    │                │                    │                     │                   │─────────────>│
+    │                │                    │                     │                   │              │
+    │                │                    │                     │                   │              │
+    │                │                    │ 12. Timeout watchdog│                   │              │
+    │                │                    │  (if no COMPLETION) │                   │              │
+    │                │                    │────────────────────>│                   │              │
+    │                │                    │  type="flow_dump"   │                   │              │
+    │                │                    │  status="failed"    │                   │              │
+    │                │                    │                     │                   │              │
+```
+
+#### 3.5.2. File management
+
+**Output location**: `/var/dump/flows/`  
+**File format**: GZIP compressed JSON Lines (JSONL) - one flow entry per line  
+**Naming**: `flow_dump_<oid>.jsonl.gz` where `<oid>` is the flow bulk get session OID
+
+**Logrotate policy**:
+- Maximum 2 files retained
+- Rotation handled by syncd
+
+**File lifecycle**: Session creation → SAI sends flows → Rotation check -> File open → Stream flows → File close → State update → Session deletion 
+
+#### 3.5.3. JSON format specification
+
+**Key fields** (always present, 7 fields):
+- `em` = eni_mac (MAC address string)
+- `vn` = vnet_id (uint16, optional - may not be present)
+- `pr` = ip_proto (uint8)
+- `si` = src_ip (IP address string)
+- `di` = dst_ip (IP address string)
+- `sp` = src_port (uint16)
+- `dp` = dst_port (uint16)
+
+**Attribute fields**:
+- Attributes are encoded as numeric keys representing enum IDs. For Eg: ACTION = 0, VERSION = 1. 
+- String equivalent for key is `(SAI_FLOW_ENTRY_ATTR_<NAME>)`
+- List of all attributes: https://github.com/opencomputeproject/SAI/blob/v1.17/experimental/saiexperimentaldashflow.h#L149
+- Values are typed based on the attribute (int, bool, string, MAC, IP)
+
+**Example JSON line:**
+```json
+{"em":"00:1a:2b:3c:4d:5e","vn":100,"pr":6,"si":"10.0.1.5","di":"192.168.1.100","sp":45678,"dp":443,"0":0,"1":1,"2":1,"3":2,"4":5,"5":false,"6":"00:1a:2b:3c:4d:6f","7":100,"8":6,"9":"192.168.1.100","10":"10.0.1.5","11":443,"12":45678,"13":1000,"14":"100.64.0.1","15":"100.64.0.2"}
+```
+
+**Attribute ID mapping** (partial list):
+| ID | Attribute Name | Type |
+|----|----------------|------|
+| 0 | action | uint32 |
+| 1 | version | uint32 |
+| 2 | dash_direction | enum |
+| 3 | dash_flow_action | enum |
+| 4 | meter_class | uint32 |
+| 5 | is_unidirectional_flow | bool |
+| 6 | reverse_flow_eni_mac | MAC |
+| 7 | reverse_flow_vnet_id | uint16 |
+
+Full mapping available in SAI header `sai_flow_entry_attr_t struct`
+
+#### 3.5.4. Scale considerations
+
+**Total per flow:** 
+
+~300 bytes when saved without compression calculated with 7 field and average of 15 attributes
+
+**64M flows (maximum scale, average load):**
+- Raw size: 300 bytes × 67,108,864 = **18.75 GB**
+- Compressed (gzip): 3-10x reduction. ~4 GB
+- Note: Compression will be done for a batch of flows as they are recieved and will be appended to the file. Higher the number of records per callback from SAI/SDK, lower the size
+
+**Important limitations:**
+- Flow dump with Mode Event is NOT suitable for full-scale dumps
+- Intended for **debugging specific flows** using filters and during tests
+- Should expand to alternatives such as gRPC for full scale
+
+#### 3.5.5. CLI (sonic-dpu-flow-dump)
+
+The `sonic-dpu-flow-dump` utility runs on the DPU and triggers a flow dump session, waits for completion, then reads the gzipped JSONL output file and prints the flows (or the file path only) to stdout. 
+
+**Usage:**
+
+```bash
+sonic-dpu-flow-dump.py [OPTIONS]
+```
+
+**Options:**
+
+| Option | Description |
+|--------|--------------|
+| `-f`, `--file-only` | Print only the output file path; do not print flow contents. |
+| `-t`, `--timeout` | Timeout in seconds to wait for session completion (default: 60). |
+| `-m`, `--max-flows` | Maximum number of flows to dump (default: 1000). |
+| `--no-flow-state` | Disable flow state (dump only values under `sai_flow_entry_t`). |
+| `-v`, `--verbose` | Enable verbose output. |
+
+
+**Example output:**
+
+```bash
+root@sonic:/home/admin# ./sonic-dpu-flow-dump.py
+[
+  {
+    "SAI_FLOW_ENTRY_ATTR_ACTION": "SAI_FLOW_ENTRY_ACTION_SET_FLOW_ENTRY_ATTR",
+    "SAI_FLOW_ENTRY_ATTR_VERSION": "1",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_VNET_ID": "100",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_SIP": "3.2.1.0",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_DIP": "101.1.2.3",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_DASH_ENCAPSULATION": "SAI_DASH_ENCAPSULATION_NVGRE",
+    "SAI_FLOW_ENTRY_ATTR_DASH_DIRECTION": "SAI_DASH_DIRECTION_OUTBOUND",
+    "SAI_FLOW_ENTRY_ATTR_SIP": "fd41:108:20:d107:64:ff71:a00:b",
+    "SAI_FLOW_ENTRY_ATTR_DIP": "2603:10e1:100:2::3401:203",
+    "SAI_FLOW_ENTRY_ATTR_DASH_FLOW_ACTION": "65",
+    "SAI_FLOW_ENTRY_ATTR_IP_ADDR_FAMILY": "SAI_IP_ADDR_FAMILY_IPV4",
+    "SAI_FLOW_ENTRY_ATTR_DASH_FLOW_SYNC_STATE": "SAI_DASH_FLOW_SYNC_STATE_FLOW_CREATED",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_SMAC": "B0:CF:0E:20:8E:DE",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_DMAC": "B0:CF:0E:20:8E:00",
+    "SAI_FLOW_ENTRY_ATTR_METER_CLASS": "3634",
+    "SAI_FLOW_ENTRY_ATTR_IS_UNIDIRECTIONAL_FLOW": "true",
+    "DST_IP": "10.2.0.100",
+    "DST_PORT": 55057,
+    "ENI_MAC": "F4:93:9F:EF:C4:7E",
+    "IP_PROTO": 17,
+    "SRC_IP": "10.0.0.11",
+    "SRC_PORT": 34074,
+    "VNET_ID": 0
+  },
+  {
+    "SAI_FLOW_ENTRY_ATTR_ACTION": "SAI_FLOW_ENTRY_ACTION_SET_FLOW_ENTRY_ATTR",
+    "SAI_FLOW_ENTRY_ATTR_VERSION": "1",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_VNET_ID": "4321",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_SIP": "3.2.1.0",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_DIP": "25.1.1.1",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_DASH_ENCAPSULATION": "SAI_DASH_ENCAPSULATION_VXLAN",
+    "SAI_FLOW_ENTRY_ATTR_DASH_DIRECTION": "SAI_DASH_DIRECTION_INBOUND",
+    "SAI_FLOW_ENTRY_ATTR_SIP": "10.2.0.100",
+    "SAI_FLOW_ENTRY_ATTR_DIP": "10.0.0.11",
+    "SAI_FLOW_ENTRY_ATTR_DASH_FLOW_ACTION": "129",
+    "SAI_FLOW_ENTRY_ATTR_IP_ADDR_FAMILY": "SAI_IP_ADDR_FAMILY_IPV6",
+    "SAI_FLOW_ENTRY_ATTR_DASH_FLOW_SYNC_STATE": "SAI_DASH_FLOW_SYNC_STATE_FLOW_CREATED",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_SMAC": "B0:CF:0E:20:8E:DE",
+    "SAI_FLOW_ENTRY_ATTR_UNDERLAY0_DMAC": "B0:CF:0E:20:8E:00",
+    "SAI_FLOW_ENTRY_ATTR_METER_CLASS": "3634",
+    "SAI_FLOW_ENTRY_ATTR_IS_UNIDIRECTIONAL_FLOW": "true",
+    "DST_IP": "fd41:108:20:d107:64:ff71:a00:b",
+    "DST_PORT": 34074,
+    "ENI_MAC": "F4:93:9F:EF:C4:7E",
+    "IP_PROTO": 17,
+    "SRC_IP": "2603:10e1:100:2::3401:203",
+    "SRC_PORT": 55057,
+    "VNET_ID": 0
+  }
+]
+```
 
 ## 4. SAI APIs
 
